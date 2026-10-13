@@ -1,0 +1,20 @@
+[
+  {
+    "value": 50,
+    "classification": "Neutral",
+    "timestamp_unix": 1748649600,
+    "datetime": "2025-05-31T00:00:00"
+  },
+  {
+    "value": 60,
+    "classification": "Greed",
+    "timestamp_unix": 1748563200,
+    "datetime": "2025-05-30T00:00:00"
+  },
+  {
+    "value": 70,
+    "classification": "Greed",
+    "timestamp_unix": 1747008000,
+    "datetime": "2025-05-12T00:00:00"
+  }
+]
