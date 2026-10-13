@@ -67,14 +67,18 @@ def configure_logging(level: str = "INFO") -> None:
 
 # ----------------------------- Environment ---------------------------------
 
-def load_env_file(path: Path) -> Dict[str, str]:
+def load_env_file(path: Path, *, warn_if_missing: bool = True) -> Dict[str, str]:
     """
-    Minimal .env reader so python-dotenv is not required.
-    Existing process environment variables take precedence over file values.
+    Read a simple KEY=VALUE env file without python-dotenv.
+
+    Existing process environment variables always take precedence over file
+    values. On Render, Secret Files are normally mounted under /etc/secrets;
+    locally, llm.env can sit beside this module.
     """
     values: Dict[str, str] = {}
-    if not path.exists():
-        LOG.warning("LLM env file not found at %s. Chat/LLM explanations will be disabled.", path)
+    if not path.is_file():
+        if warn_if_missing:
+            LOG.warning("LLM env file not found at %s.", path)
         return values
 
     try:
@@ -92,20 +96,79 @@ def load_env_file(path: Path) -> Dict[str, str]:
             if key:
                 values[key] = value
     except OSError as exc:
-        LOG.error("Could not read %s: %s", path, exc)
+        LOG.error("Could not read LLM env file %s: %s", path, exc)
         return {}
 
+    # Do not overwrite Render dashboard environment variables.
     for key, value in values.items():
         os.environ.setdefault(key, value)
     return values
 
 
-ENV_VALUES = load_env_file(PROJECT_ROOT / "llm.env")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
-OPENROUTER_MODEL = os.getenv(
-    "OPENROUTER_MODEL", "meta-llama/llama-4-maverick:free"
-).strip()
+def _llm_env_candidates() -> List[Path]:
+    """Return likely env-file locations, with an explicit path taking priority."""
+    candidates: List[Path] = []
+    configured_path = os.getenv("LLM_ENV_PATH", "").strip()
+    if configured_path:
+        candidates.append(Path(configured_path).expanduser())
+
+    # Render Secret Files are mounted here. Keep local paths as fallbacks.
+    candidates.extend([
+        Path("/etc/secrets/llm.env"),
+        PROJECT_ROOT / "llm.env",
+        Path.cwd() / "llm.env",
+    ])
+
+    unique: List[Path] = []
+    seen = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved not in seen:
+            unique.append(resolved)
+            seen.add(resolved)
+    return unique
+
+
+def refresh_llm_config() -> Tuple[str, str, Optional[str]]:
+    """
+    Refresh OpenRouter settings from the process environment and llm.env.
+    Returns (API key, model, source path); never logs or returns the key in logs.
+    """
+    loaded_path: Optional[str] = None
+    for candidate in _llm_env_candidates():
+        values = load_env_file(candidate, warn_if_missing=False)
+        if values:
+            loaded_path = str(candidate)
+            # Prefer an already-defined process variable; otherwise use the
+            # values read from the first env file that contains configuration.
+            if os.getenv("OPENROUTER_API_KEY", "").strip():
+                break
+            if values.get("OPENROUTER_API_KEY", "").strip():
+                break
+
+    api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    model = os.getenv(
+        "OPENROUTER_MODEL", "meta-llama/llama-4-maverick:free"
+    ).strip() or "meta-llama/llama-4-maverick:free"
+    return api_key, model, loaded_path
+
+
+ENV_VALUES: Dict[str, str] = {}
+OPENROUTER_API_KEY, OPENROUTER_MODEL, _LLM_ENV_SOURCE = refresh_llm_config()
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+
+def llm_config_status() -> Dict[str, Any]:
+    """Safe diagnostics for health checks; never expose the secret itself."""
+    api_key, model, source = refresh_llm_config()
+    return {
+        "configured": bool(api_key),
+        "model": model,
+        "env_file_loaded": bool(source),
+        "env_file_path": source,
+        "api_key_source": "process_environment" if os.getenv("OPENROUTER_API_KEY", "").strip()
+        and source is None else ("environment_or_env_file" if api_key else "missing"),
+    }
 
 
 # ----------------------------- Existing modules ---------------------------
@@ -985,27 +1048,30 @@ answer normally and naturally."""
 
 
 def call_openrouter(messages: List[Dict[str, str]], timeout: int = 60) -> str:
-    if not OPENROUTER_API_KEY:
+    api_key, model, env_source = refresh_llm_config()
+    if not api_key:
+        expected = ", ".join(str(p) for p in _llm_env_candidates())
         raise RuntimeError(
-            f"OPENROUTER_API_KEY was not found. Add it to {PROJECT_ROOT / 'llm.env'}."
+            "OPENROUTER_API_KEY is missing. Set it in Render Environment Variables "
+            "or add it to a Render Secret File named llm.env. Checked: " + expected
         )
     if requests is None:
         raise RuntimeError("The requests package is required for LLM chat.")
     payload = {
-        "model": OPENROUTER_MODEL,
+        "model": model,
         "messages": [{"role": "system", "content": SYSTEM_PROMPT}] + messages,
         "temperature": 0.4,
         "max_tokens": 1200,
     }
     headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
         "HTTP-Referer": "http://localhost",
         "X-Title": "Crypto Signal Handler",
     }
     response = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=timeout)
     if response.status_code >= 400:
-        safe_body = response.text[:500].replace(OPENROUTER_API_KEY, "[REDACTED]")
+        safe_body = response.text[:500].replace(api_key, "[REDACTED]")
         raise RuntimeError(f"OpenRouter HTTP {response.status_code}: {safe_body}")
     try:
         body = response.json()
